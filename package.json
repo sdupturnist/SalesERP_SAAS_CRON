@@ -1,0 +1,22 @@
+{
+  "name": "email-cron",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1093.0",
+    "dotenv": "^17.2.3",
+    "mysql2": "^3.16.3",
+    "node-cron": "^4.2.1",
+    "nodemailer": "^7.0.13"
+  }
+}
