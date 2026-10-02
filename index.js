@@ -407,9 +407,50 @@ async function upsertNotification(conn, payload) {
 // queued once (plus a UNIQUE dedupe_key as a second guard).
 
 const WA_PLAN_TTL_MS = 60 * 1000;
-const WA_MAX_AGE_HOURS = 2; // a reminder older than this is dropped, never sent late
+const WA_MAX_AGE_HOURS = 2; // a reminder still unsent this long AFTER it was due is dropped, never sent late
 const waPlanCache = new Map(); // plan_id -> { on, at }
 let waOutboxWarned = false;
+
+// When CRM reminders reach WhatsApp. The in-app/push/email alerts still fire at the
+// first run of each day; only the WhatsApp message is HELD until this time of day
+// (cron timezone). Master -> Settings -> Cron Schedule -> "WhatsApp reminder time".
+//   never saved -> 08:00   |   saved blank -> send as soon as created   |   "HH:mm" -> that time
+const WA_TIME_KEY = "whatsapp_reminder_time";
+const WA_DEFAULT_TIME = "08:00";
+const WA_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+let waTimeCache = { at: 0, value: WA_DEFAULT_TIME };
+
+async function getWhatsappSendTime() {
+  if (Date.now() - waTimeCache.at < WA_PLAN_TTL_MS) return waTimeCache.value;
+  let value = WA_DEFAULT_TIME;
+  try {
+    const [rows] = await masterPool.query(
+      "SELECT `value` FROM master_settings WHERE `key` = ? LIMIT 1",
+      [WA_TIME_KEY],
+    );
+    if (rows.length) {
+      const v = String(rows[0].value ?? "").trim();
+      if (v === "") value = null;            // blank = immediate
+      else if (WA_TIME_RE.test(v)) value = v; // valid HH:mm
+      // anything else: keep the default rather than guess
+    }
+  } catch (err) {
+    console.error("[WhatsApp] send-time lookup failed:", err.message);
+  }
+  waTimeCache = { at: Date.now(), value };
+  return value;
+}
+
+// Whole minutes from now until the next HH:mm today in the cron timezone; 0 if that time
+// has already passed today (a reminder due today is sent now, never pushed to tomorrow).
+function minutesUntilToday(hhmm, now = new Date()) {
+  if (!hhmm) return 0;
+  const [H, M, S] = getLocalIsoString(now).slice(11, 19).split(":").map(Number);
+  const nowMin = H * 60 + M + S / 60;
+  const [th, tm] = hhmm.split(":").map(Number);
+  const target = th * 60 + tm;
+  return target > nowMin ? Math.ceil(target - nowMin) : 0;
+}
 
 async function isWhatsappPlanOn(client) {
   const planId = client?.plan_id;
@@ -472,10 +513,13 @@ async function queueWhatsappReminder(conn, client, { userId, groupKey, emoji, ti
     try { link = href ? `${getClientBaseUrl(client.subdomain)}${href}` : ""; } catch { link = ""; }
     const body = [`${emoji} *${title}*`, message, context, link].filter(Boolean).join("\n");
 
+    // Hold until the configured time of day (relative minutes, so DB-server timezone is irrelevant).
+    const holdMinutes = minutesUntilToday(await getWhatsappSendTime());
+
     await conn.execute(
       `INSERT IGNORE INTO whatsapp_outbox (user_id, to_number, body, kind, dedupe_key, status, next_attempt_at)
-       VALUES (?, ?, ?, 'reminder', ?, 'pending', NOW())`,
-      [userId, to, body, `rem:${groupKey}:${userId}`.slice(0, 190)],
+       VALUES (?, ?, ?, 'reminder', ?, 'pending', NOW() + INTERVAL ? MINUTE)`,
+      [userId, to, body, `rem:${groupKey}:${userId}`.slice(0, 190), holdMinutes],
     );
   } catch (err) {
     // Missing table/columns (migration not run yet) must never break the cron.
@@ -486,13 +530,15 @@ async function queueWhatsappReminder(conn, client, { userId, groupKey, emoji, ti
   }
 }
 
-// Drop reminders that waited too long (WhatsApp offline for hours): a stale
-// "due today" arriving the next morning is worse than none.
+// Drop reminders that missed their send window (WhatsApp offline for hours): a stale
+// "due today" arriving the next morning is worse than none. Measured from the time the
+// message was DUE (next_attempt_at), not from creation, so a message deliberately held
+// overnight until 08:00 is not expired before it is sent.
 async function sweepWhatsappOutbox(conn) {
   try {
     await conn.execute(
       `UPDATE whatsapp_outbox SET status = 'expired', last_error = 'too old to send'
-        WHERE status = 'pending' AND created_at < (NOW() - INTERVAL ${WA_MAX_AGE_HOURS} HOUR)`,
+        WHERE status = 'pending' AND next_attempt_at < (NOW() - INTERVAL ${WA_MAX_AGE_HOURS} HOUR)`,
     );
   } catch (_) { /* table not migrated yet */ }
 }
