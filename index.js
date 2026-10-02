@@ -352,7 +352,7 @@ async function upsertNotification(conn, payload) {
   } = payload;
 
   if (!userId || !groupKey || !type || !entityType || !entityId || !title) {
-    return;
+    return { created: false };
   }
 
   const [rows] = await conn.execute(
@@ -369,7 +369,7 @@ async function upsertNotification(conn, payload) {
       `,
       [title, message, JSON.stringify(meta || {}), status, rows[0].id],
     );
-    return;
+    return { created: false };
   }
 
   await conn.execute(
@@ -394,6 +394,107 @@ async function upsertNotification(conn, payload) {
       status,
     ],
   );
+  return { created: true };
+}
+
+// ─────────────────────────────────────────────
+// WhatsApp reminders (queued here, sent by the CRM web process)
+// ─────────────────────────────────────────────
+// This daemon is a separate process and cannot reach the live WhatsApp
+// connection, which lives inside the CRM web server. So a CRM alert is written
+// to the tenant's `whatsapp_outbox` table; the web process drains it. Called
+// ONLY when upsertNotification just CREATED the in-app row, so each alert is
+// queued once (plus a UNIQUE dedupe_key as a second guard).
+
+const WA_PLAN_TTL_MS = 60 * 1000;
+const WA_MAX_AGE_HOURS = 2; // a reminder older than this is dropped, never sent late
+const waPlanCache = new Map(); // plan_id -> { on, at }
+let waOutboxWarned = false;
+
+async function isWhatsappPlanOn(client) {
+  const planId = client?.plan_id;
+  if (!planId) return false;
+  const hit = waPlanCache.get(planId);
+  if (hit && Date.now() - hit.at < WA_PLAN_TTL_MS) return hit.on;
+  let on = false;
+  try {
+    const [rows] = await masterPool.query(
+      "SELECT status, plans FROM plans WHERE id = ? LIMIT 1",
+      [planId],
+    );
+    const plan = rows[0];
+    if (plan && plan.status === "active") {
+      let flags = plan.plans;
+      if (typeof flags === "string") {
+        try { flags = JSON.parse(flags); } catch { flags = null; }
+      }
+      on = Boolean(flags && flags.whatsapp_notifications === true); // strict opt-in
+    }
+  } catch (err) {
+    console.error("[WhatsApp] plan lookup failed:", err.message);
+  }
+  waPlanCache.set(planId, { on, at: Date.now() });
+  return on;
+}
+
+// International digits only (e.g. "+971 50 123 4567" -> "971501234567"); null if
+// it cannot be a valid international number. Mirrors src/app/utils/whatsappNumber.js.
+function normalizeWhatsappNumber(raw) {
+  if (raw === null || raw === undefined) return null;
+  let v = String(raw).trim().replace(/[\s\-().]/g, "");
+  if (!v) return null;
+  if (v.startsWith("+")) v = v.slice(1);
+  else if (v.startsWith("00")) v = v.slice(2);
+  if (!/^\d+$/.test(v) || v.startsWith("0")) return null;
+  if (v.length < 8 || v.length > 15) return null;
+  return v;
+}
+
+async function queueWhatsappReminder(conn, client, { userId, groupKey, emoji, title, message, context, href }) {
+  try {
+    if (!(await isWhatsappPlanOn(client))) return;
+
+    // Only users who actually linked WhatsApp, and turned reminders ON.
+    const [users] = await conn.execute(
+      `SELECT u.mobile_number, u.whatsapp_reminders_enabled, u.whatsapp_reminder_number
+         FROM \`user\` u
+         JOIN whatsapp_instances wi ON wi.user_id = u.user_id
+        WHERE u.user_id = ? LIMIT 1`,
+      [userId],
+    );
+    const u = users[0];
+    if (!u || Number(u.whatsapp_reminders_enabled) !== 1) return;
+
+    const to = normalizeWhatsappNumber(u.whatsapp_reminder_number) || normalizeWhatsappNumber(u.mobile_number);
+    if (!to) return;
+
+    let link = "";
+    try { link = href ? `${getClientBaseUrl(client.subdomain)}${href}` : ""; } catch { link = ""; }
+    const body = [`${emoji} *${title}*`, message, context, link].filter(Boolean).join("\n");
+
+    await conn.execute(
+      `INSERT IGNORE INTO whatsapp_outbox (user_id, to_number, body, kind, dedupe_key, status, next_attempt_at)
+       VALUES (?, ?, ?, 'reminder', ?, 'pending', NOW())`,
+      [userId, to, body, `rem:${groupKey}:${userId}`.slice(0, 190)],
+    );
+  } catch (err) {
+    // Missing table/columns (migration not run yet) must never break the cron.
+    if (!waOutboxWarned) {
+      waOutboxWarned = true;
+      console.error("[WhatsApp] could not queue reminder (is client_changes.sql entry 58 applied?):", err.message);
+    }
+  }
+}
+
+// Drop reminders that waited too long (WhatsApp offline for hours): a stale
+// "due today" arriving the next morning is worse than none.
+async function sweepWhatsappOutbox(conn) {
+  try {
+    await conn.execute(
+      `UPDATE whatsapp_outbox SET status = 'expired', last_error = 'too old to send'
+        WHERE status = 'pending' AND created_at < (NOW() - INTERVAL ${WA_MAX_AGE_HOURS} HOUR)`,
+    );
+  } catch (_) { /* table not migrated yet */ }
 }
 
 async function resolveDealsNotifications(conn, todayStr, expiringSoonDateStr) {
@@ -1243,6 +1344,8 @@ async function processAllTaskReminders() {
           const cfg = getClientDbConfig(client);
           conn = await getClientPool(cfg).getConnection();
 
+          await sweepWhatsappOutbox(conn);
+
           // ── 0. Per-client configurable "days before due" ─────────────────────
           // Only the positive before-due offsets are configurable; the
           // always-on tail (due-today, 1/2/3-days-overdue) never changes.
@@ -1398,7 +1501,7 @@ async function processAllTaskReminders() {
               : `Task overdue by ${Math.abs(days)} day${Math.abs(days) > 1 ? "s" : ""}`;
 
             // In-app notification
-            await upsertNotification(conn, {
+            const upResult = await upsertNotification(conn, {
               type:             notifType,
               category:         kind === "deal" ? "deals" : "leads",
               entityType:       kind === "deal" ? "deal_task" : "lead_task",
@@ -1431,6 +1534,22 @@ async function processAllTaskReminders() {
               entityId: String(task.id),
               href: kind === "deal" ? `/deals/${task.deal_id}` : `/lead/view/${task.lead_id}`,
             });
+
+            // WhatsApp (queued once, only when the in-app row was just created)
+            if (upResult && upResult.created) {
+              await queueWhatsappReminder(conn, client, {
+                userId:  recipientUserId,
+                groupKey,
+                emoji:   days < 0 ? "⚠️" : "⏰",
+                title:   task.title,
+                message,
+                context: [
+                  kind === "deal" ? (task.deal_name && `Deal: ${task.deal_name}`) : (task.lead_name && `Lead: ${task.lead_name}`),
+                  task.customer_name && `Customer: ${task.customer_name}`,
+                ].filter(Boolean).join(" · "),
+                href:    kind === "deal" ? `/deals/${task.deal_id}` : `/lead/view/${task.lead_id}`,
+              });
+            }
 
             // Email (only on selected stages). sendTaskReminderEmail resolves
             // to false on any send failure (missing settings, transport
@@ -1645,7 +1764,7 @@ async function processDealTasksReminders() {
               : `deal-expiring-soon:${deal.id}:${closeDateStr}`;
 
             for (const recipientUserId of recipientUserIds) {
-              await upsertNotification(conn, {
+              const dealUp = await upsertNotification(conn, {
                 type: isOverdue ? "deal_overdue" : "deal_expiring_soon",
                 entityType: "deal",
                 entityId: deal.id,
@@ -1665,6 +1784,18 @@ async function processDealTasksReminders() {
                 },
                 groupKey,
               });
+
+              if (dealUp && dealUp.created) {
+                await queueWhatsappReminder(conn, client, {
+                  userId:  recipientUserId,
+                  groupKey,
+                  emoji:   isOverdue ? "⚠️" : "📅",
+                  title:   deal.deal_name,
+                  message: isOverdue ? "Deal overdue for closing" : "Deal closing soon",
+                  context: deal.customer_name ? `Customer: ${deal.customer_name}` : "",
+                  href:    `/deals/${deal.id}`,
+                });
+              }
 
               await sendExpoPushNotifications(
                 conn,
