@@ -880,6 +880,179 @@ async function processDocumentExpiryNotifications() {
   }
 }
 
+// ─────────────────────────────────────────────
+// HR: employee passport / Emirates ID / visa expiry alerts
+// ─────────────────────────────────────────────
+// In-app only (no push / WhatsApp / email — these concern staff documents, not sales work).
+// Runs only for tenants whose plan ticks HR (`employee` flag, strict opt-in, same rule as the web app).
+// Recipients: superadmins + users whose role grants employee.view. One alert per document per user,
+// refreshed at most once a day, auto-resolved when the date is renewed / the employee leaves.
+const HR_EXPIRY_WINDOW_DAYS = 60; // visas need a longer lead time than the 30-day customer/supplier default
+const HR_EXPIRY_FIELDS = [
+  { col: "visa_expiry", label: "Residence visa" },
+  { col: "emirates_id_expiry", label: "Emirates ID" },
+  { col: "passport_expiry", label: "Passport" },
+];
+const hrPlanCache = new Map(); // plan_id -> { on, at }
+
+async function isHrPlanOn(client) {
+  const planId = client?.plan_id;
+  if (!planId) return false;
+  const hit = hrPlanCache.get(planId);
+  if (hit && Date.now() - hit.at < WA_PLAN_TTL_MS) return hit.on;
+  let on = false;
+  try {
+    const [rows] = await masterPool.query("SELECT status, plans FROM plans WHERE id = ? LIMIT 1", [planId]);
+    const plan = rows[0];
+    if (plan && plan.status === "active") {
+      let flags = plan.plans;
+      if (typeof flags === "string") {
+        try { flags = JSON.parse(flags); } catch { flags = null; }
+      }
+      on = Boolean(flags && (flags.employee === true || flags.employee === 1)); // strict opt-in
+    }
+  } catch (err) {
+    console.error("[HR expiry] plan lookup failed:", err.message);
+  }
+  hrPlanCache.set(planId, { on, at: Date.now() });
+  return on;
+}
+
+// Users who may see employee data: superadmin, or a role whose privileges grant employee.view.
+async function getEmployeeViewers(conn) {
+  const [users] = await conn.execute(
+    `SELECT u.user_id, u.role_id, u.status, r.privileges
+       FROM \`user\` u LEFT JOIN role r ON CAST(r.role_id AS CHAR) = CAST(u.role_id AS CHAR)`,
+  );
+  const out = [];
+  for (const u of users) {
+    const st = parseJsonArraySafe(u.status)?.[0];
+    if (st && Number(st.id) !== 12) continue; // inactive user
+    const isSuper = Number(u.user_id) === 1 || String(u.role_id).toLowerCase() === "superadmin";
+    let canView = isSuper;
+    if (!canView) {
+      try {
+        const privs = typeof u.privileges === "string" ? JSON.parse(u.privileges || "{}") : u.privileges || {};
+        canView = !!privs?.employee?.view;
+      } catch { canView = false; }
+    }
+    if (canView) out.push(u.user_id);
+  }
+  return out;
+}
+
+async function processHrExpiryNotifications() {
+  let masterConnection;
+  try {
+    masterConnection = await masterPool.getConnection();
+    const [clients] = await masterConnection.execute("SELECT * FROM clients WHERE status = 'active'");
+    masterConnection.release();
+    masterConnection = null;
+
+    const todayStr = getLocalIsoString(new Date()).slice(0, 10);
+    const today = new Date(todayStr);
+    const summary = { clients: 0, alerts: 0 };
+
+    await runInBatches(
+      clients.filter(shouldProcessClient),
+      runtimeState.maxParallelClients,
+      async (client) => {
+        if (!(await isHrPlanOn(client))) return;
+        let conn;
+        try {
+          const cfg = getClientDbConfig(client);
+          conn = await getClientPool(cfg).getConnection();
+          summary.clients += 1;
+
+          const [nsRows] = await conn
+            .execute("SELECT doc_expiry_enabled, doc_expiry_days FROM notification_settings ORDER BY id DESC LIMIT 1")
+            .catch(() => [[]]);
+          const enabled = nsRows?.[0] ? Number(nsRows[0].doc_expiry_enabled) !== 0 : true;
+          const configured = parseJsonArraySafe(nsRows?.[0]?.doc_expiry_days).map(Number).filter(Number.isFinite);
+          const windowDays = Math.max(HR_EXPIRY_WINDOW_DAYS, ...(configured.length ? configured : [0]));
+
+          const validGroupKeys = new Set();
+          if (enabled) {
+            const [employees] = await conn
+              .execute(
+                `SELECT employee_id, full_name, employee_number, ${HR_EXPIRY_FIELDS.map((f) => f.col).join(", ")}
+                   FROM employee
+                  WHERE (CASE WHEN JSON_VALID(status) THEN JSON_UNQUOTE(JSON_EXTRACT(status, '$[0].key')) = 'active' ELSE 0 END)
+                    AND (last_working_date IS NULL OR last_working_date >= CURDATE())`,
+              )
+              .catch((e) => {
+                if (e?.code === "ER_NO_SUCH_TABLE") return [[]]; // HR not migrated for this tenant yet
+                throw e;
+              });
+
+            if (employees.length) {
+              const viewers = await getEmployeeViewers(conn);
+              for (const emp of employees) {
+                for (const { col, label } of HR_EXPIRY_FIELDS) {
+                  if (!emp[col]) continue;
+                  const d = emp[col] instanceof Date ? getLocalIsoString(emp[col]).slice(0, 10) : String(emp[col]).slice(0, 10);
+                  const expiry = new Date(d);
+                  if (Number.isNaN(expiry.getTime())) continue;
+                  const daysUntil = Math.round((expiry.getTime() - today.getTime()) / 86400000);
+                  if (daysUntil > windowDays) continue;
+
+                  const groupKey = `hrexpiry:${emp.employee_id}:${col}`;
+                  validGroupKeys.add(groupKey);
+                  const who = emp.employee_number ? `${emp.full_name} (${emp.employee_number})` : emp.full_name;
+                  const expired = daysUntil < 0;
+                  for (const userId of viewers) {
+                    const [existing] = await conn.execute(
+                      "SELECT id, DATE(updated_at) AS updated_date FROM notifications WHERE user_id = ? AND group_key = ? LIMIT 1",
+                      [String(userId), groupKey],
+                    );
+                    if (existing.length && String(existing[0].updated_date).slice(0, 10) === todayStr) continue;
+                    const r = await upsertNotification(conn, {
+                      type: "employee_doc_expiring",
+                      category: "documents",
+                      entityType: "employee_doc",
+                      entityId: emp.employee_id,
+                      userId,
+                      title: expired ? "Employee document expired" : "Employee document expiring soon",
+                      message: expired
+                        ? `${label} of ${who} expired ${Math.abs(daysUntil)} day(s) ago (${d})`
+                        : `${label} of ${who} expires in ${daysUntil} day(s) (${d})`,
+                      meta: { docName: label, docExpiryDate: d, daysUntilExpiry: daysUntil, entityName: emp.full_name, href: `/employee/view/${emp.employee_id}` },
+                      groupKey,
+                    });
+                    if (r.created) summary.alerts += 1;
+                  }
+                }
+              }
+            }
+          }
+
+          // clear alerts for renewed dates, leavers, or when the feature was switched off
+          const [open] = await conn.execute(
+            "SELECT id, group_key FROM notifications WHERE type = 'employee_doc_expiring' AND status IN ('unread', 'read')",
+          );
+          const stale = open.filter((r) => !validGroupKeys.has(r.group_key)).map((r) => r.id);
+          if (stale.length) {
+            await conn.execute(
+              `UPDATE notifications SET status = 'resolved', updated_at = NOW() WHERE id IN (${stale.map(() => "?").join(",")})`,
+              stale,
+            );
+          }
+        } catch (err) {
+          console.error(`[HR expiry] Error processing client ${client.subdomain}:`, err.message);
+        } finally {
+          if (conn) conn.release();
+        }
+      },
+    );
+    return summary;
+  } catch (err) {
+    console.error("[HR expiry] processHrExpiryNotifications error:", err.message);
+    throw err;
+  } finally {
+    if (masterConnection) masterConnection.release();
+  }
+}
+
 async function resolveDocumentExpiryNotifications(conn, validGroupKeys) {
   const [rows] = await conn.execute(
     `SELECT id, group_key FROM notifications
@@ -1691,6 +1864,7 @@ async function runJob() {
     { name: "deal_task_reminders", run: processDealTasksReminders },
     { name: "task_reminders", run: processAllTaskReminders },
     { name: "document_expiry_notifications", run: processDocumentExpiryNotifications },
+    { name: "hr_expiry_notifications", run: processHrExpiryNotifications },
   ];
 
   try {
